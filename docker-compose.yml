@@ -1,0 +1,26 @@
+services:
+  api:
+    build: .
+    image: tender-collector-api:1.0.0
+    container_name: tender-collector-api
+    ports:
+      - "8000:8000"
+    depends_on:
+      sample-site:
+        condition: service_healthy
+    restart: unless-stopped
+
+  sample-site:
+    image: nginx:1.27-alpine
+    container_name: tender-sample-site
+    ports:
+      - "8080:80"
+    volumes:
+      - ./sample-site:/usr/share/nginx/html:ro
+      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost/list.html"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
