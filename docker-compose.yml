@@ -1,7 +1,7 @@
 services:
   api:
     build: .
-    image: tender-collector-api:1.0.0
+    image: tender-collector-api:1.1.0
     container_name: tender-collector-api
     ports:
       - "8000:8000"
@@ -10,6 +10,10 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  # 本地限价清单样例站点：nginx 只读挂载 sample-site/，
+  # 内含公告列表、原公告/更正/取消详情页，以及带 rowspan 合并单元格的
+  # 最高限价清单（含整包限价、字段冲突对照页、404 失败演练页）。
+  # 全部资源均为容器内静态文件，报价核对 API 可完全离线调用，不依赖外网。
   sample-site:
     image: nginx:1.27-alpine
     container_name: tender-sample-site

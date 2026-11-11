@@ -1,8 +1,14 @@
-# 采购公告采集 API
+# 采购公告采集与报价核对 API
 
-传入**采购公告列表页 URL** 与**项目编号**，自动抓取该页指向的同站点原公告与更正公告，
-从详情页提取发布时间、投标截止时间与取消采购信息，按发布时间合并后返回：
-当前是否可投标、有效截止时间、项目状态以及全部来源链接。
+提供两组能力：
+
+1. **公告采集**：传入**采购公告列表页 URL** 与**项目编号**，自动抓取该页指向的同站点原公告与更正公告，
+   从详情页提取发布时间、投标截止时间与取消采购信息，按发布时间合并后返回：
+   当前是否可投标、有效截止时间、项目状态以及全部来源链接。
+2. **报价核对**：传入列表页 URL、项目编号、包号及报价行（清单项编码 + 单价），
+   自动定位该项目**原公告链接的同站 HTML 限价清单**，还原合并单元格跨行填写的包号，
+   解析各项编码、数量、最高单价与整包限价；按“清单数量 × 报价单价、四舍五入到分后汇总”的口径，
+   分别检查**分项单价**与**整包总价**是否超过公告限价，缺报/重复/冲突/读取失败时标记**待核实**。
 
 ## 业务规则
 
@@ -28,16 +34,18 @@
 ```
 .
 ├── app/
-│   ├── main.py        # FastAPI 入口、路由、浏览器演示页
-│   ├── collector.py   # 采集编排：列表发现 → 并发抓取 → 归属判定 → 合并
-│   ├── parser.py      # HTML 解析：同站链接发现、三层字段提取、取消识别
-│   ├── merger.py      # 业务合并规则（时间继承、延期覆盖、取消、待核实）
-│   └── models.py      # 请求/响应 Pydantic 模型
-├── sample-site/       # 本地示例公告站点（nginx 静态托管）
-│   ├── list.html      # 公告列表页（含外站/登录干扰链接）
-│   └── detail/        # 3 个项目的原公告/更正/取消详情页
-├── nginx/default.conf # 示例站点 nginx 配置（缺失页面返回真实 404）
-├── tests/             # 解析/合并单测 + 本地静态服务器端到端测试（30 个用例）
+│   ├── main.py          # FastAPI 入口、路由、浏览器演示页（采集 + 报价核对两个 Tab）
+│   ├── collector.py     # 采集编排与共享发现逻辑：列表发现 → 并发抓取 → 归属判定 → 合并
+│   ├── parser.py        # 公告 HTML 解析：同站链接发现、三层字段提取、取消识别
+│   ├── price_parser.py  # 限价清单解析：rowspan/colspan 还原、表头映射、金额标准化
+│   ├── merger.py        # 业务合并规则（时间继承、延期覆盖、取消、待核实）
+│   ├── quote.py         # 报价核对编排与规则（金额计算、超限/冲突/缺报判定、来源追溯）
+│   └── models.py        # 请求/响应 Pydantic 模型
+├── sample-site/         # 本地示例公告站点（nginx 静态托管，可完全离线使用）
+│   ├── list.html        # 公告列表页（含外站/登录干扰链接）
+│   └── detail/          # 3 个项目的原公告/更正/取消详情页 + 限价清单样例
+├── nginx/default.conf   # 示例站点 nginx 配置（缺失页面返回真实 404）
+├── tests/               # 解析/合并/报价单测 + 本地静态服务器端到端测试（73 个用例）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt
@@ -54,7 +62,7 @@ docker compose up --build
 | 服务 | 地址 | 说明 |
 | --- | --- | --- |
 | 公告采集 API | http://localhost:8000 | Swagger 文档：http://localhost:8000/docs |
-| 浏览器演示页 | http://localhost:8000/ | 填表即可发起采集 |
+| 浏览器演示页 | http://localhost:8000/ | 两个 Tab：填表即可发起采集或报价核对 |
 | 示例公告站点 | http://localhost:8080/list.html | nginx 托管的静态采购公告 |
 
 停止：`docker compose down`。
@@ -117,7 +125,111 @@ curl "http://localhost:8000/api/v1/collect?list_url=http://localhost:8080/list.h
 > 接入真实采购平台时，若页面结构不同，优先在详情页模板中补 `data-field` 标记，
 > 或在 `app/parser.py` 顶部的标签/关键词元组中登记该平台的字段叫法。
 
-## 本地开发与测试（不使用 Docker）
+## 报价核对 API（`POST /api/v1/quote-check`）
+
+### 请求
+
+| 字段 | 说明 |
+| --- | --- |
+| `list_url` | 采购公告列表页 URL（与采集接口一致） |
+| `project_code` | 项目编号，如 `GSB-2026-001` |
+| `package_no` | 包号，支持 `1` / `第1包` / `包1` 等写法（自动规范化） |
+| `lines` | 报价行数组：`item_code`（清单项编码）+ `unit_price`（报价单价，元） |
+| `timeout` | 单次请求超时秒数，默认 10 |
+
+```bash
+curl -X POST http://localhost:8000/api/v1/quote-check \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "list_url": "http://localhost:8080/list.html",
+    "project_code": "GSB-2026-001",
+    "package_no": "2",
+    "lines": [
+      {"item_code": "YM-101", "unit_price": "260.00"},
+      {"item_code": "YM-102", "unit_price": "16.25"}
+    ]
+  }'
+```
+
+### 核对口径与状态
+
+- **逐项金额**：`本行金额 = 清单数量 × 报价单价`，使用 `Decimal` 精确计算并按
+  `ROUND_HALF_UP` **四舍五入到分**；整包报价为各行金额之和。
+- **分项检查**：报价单价 > 清单“最高单价限价” → 该行 `over_limit`。
+- **整包检查**：整包报价 > 整包限价 → 包级 `over_limit`；等于限价不算超限。
+- `status` 取值：`ok`（未超限）/ `over_limit`（明确超限）/ `pending`（待核实）/ `not_found`（未找到公告或包号）。
+
+下列情况标记 **`pending` 待核实**，不输出确定的超限结论：
+
+| 场景 | 处理 |
+| --- | --- |
+| 清单有项但报价**缺报** | 该行 `quoted_unit_price=null`，整包报价置 `null` |
+| 报价中**重复编码** | 对应行与包级均标注重复原因 |
+| 报价编码**不在清单** | 单列结果行，原因“报价编码不在限价清单中” |
+| 清单同一编码的**数量/最高单价跨表或跨页不一致** | 字段冲突，冲突值置 `null` |
+| **整包限价**多值冲突或清单未提供 | `package_limit=null`，仅完成可判定的分项核对 |
+| 限价清单**关联页面读取失败**（404/超时/结构异常） | 包级待核实，失败 URL 进入 `sources(role=failed)`；若公告正文内嵌清单表格则回退解析并照常输出分项明细 |
+
+### 响应关键字段
+
+```json
+{
+  "project_code": "GSB-2026-001",
+  "package_no": "2",
+  "status": "ok",
+  "package": {
+    "package_no": "2",
+    "status": "ok",
+    "quoted_total": "52000.00",
+    "package_limit": "52000.00",
+    "reasons": []
+  },
+  "line_results": [
+    {
+      "item_code": "YM-101",
+      "item_name": "行道树补植（含支撑架）",
+      "quantity": "150",
+      "unit": "株",
+      "limit_unit_price": "260.00",
+      "quoted_unit_price": "260.00",
+      "quoted_amount": "39000.00",
+      "status": "ok",
+      "reasons": [],
+      "source_url": "http://localhost:8080/detail/g001-price-2.html"
+    }
+  ],
+  "sources": [
+    {"role": "list", "url": "..."},
+    {"role": "original", "url": "..."},
+    {"role": "price_list", "url": ".../g001-price-2.html"}
+  ],
+  "warnings": []
+}
+```
+
+### 限价清单解析能力（`app/price_parser.py`）
+
+- **合并单元格还原**：把 `rowspan`/`colspan` 展开为规则网格，包号跨行只写一次时自动继承到每个明细项；
+- **表头识别**：按“包号/编码/名称/单位/数量/最高单价/整包限价”等中文关键词映射列，兼容不同叫法；
+- **整包限价**：支持独立“包预算汇总表”，也支持明细表内的整包限价列（可跨行合并）；
+- **金额格式**：支持千分位、`￥/元` 后缀与中文大写金额（如 `柒万陆仟柒佰伍拾元整`）；
+- **链接发现**：仅跟踪原公告指向的**同站点**、且 href/文本含“限价/清单/预算/采购需求/工程量/明细”语义的链接，
+  登录/导航/外站链接自动忽略；没有独立清单页时回退解析公告正文内嵌表格。
+
+### 样例站点内置的限价清单（离线可用）
+
+| 页面 | 场景 |
+| --- | --- |
+| `detail/g001-price-1.html` | 第1包：包号 `rowspan` 跨行 + 独立整包限价汇总表（含中文大写金额） |
+| `detail/g001-price-2.html` | 第2包：明细表内整包限价列跨行合并 |
+| `detail/g001-price-conflict.html` | 第1包第二来源：与首份清单数量/单价/整包限价不一致，演练**字段冲突 → 待核实** |
+| `detail/g003-price-missing.html`（不存在） | 链接保留但页面 404，演练**关联页面读取失败 → 待核实** |
+| `detail/g003-price-embedded.html` | 公告直接链接的内嵌清单备份页 |
+
+以上页面均由 docker compose 中的 `sample-site` 容器以 nginx 静态文件提供，
+**整套报价核对链路无需访问外网即可离线调用**。
+
+
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
